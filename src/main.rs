@@ -142,7 +142,17 @@ impl<'a> PrinterInterface<'a> {
     }
 
     fn send_message(&self) {
-        todo!()
+        let mut message = String::new();
+        println!("Enter message to send: ");
+        std::io::stdin()
+            .read_line(&mut message)
+            .expect("Failed to read input");
+        self.server
+            .send_message(&message, &self.printer.address)
+            .map_or_else(
+                |_| println!("Failed to send message"),
+                |response| println!("Message sent: {}", response.body),
+            );
     }
 }
 
