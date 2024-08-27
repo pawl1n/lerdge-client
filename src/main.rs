@@ -170,7 +170,6 @@ impl MainInterface {
             println!("Main interface");
             println!("1. Search for printers");
             println!("2. Select a printer");
-            // println!("3. Connect manually");
             println!("0. Exit");
 
             let mut input = String::new();
@@ -186,8 +185,6 @@ impl MainInterface {
             match index {
                 1 => self.search(),
                 2 => self.select_printer(),
-                // 3 => self.show_stats(),
-                // 4 => self.connect_manually(),
                 0 => break,
                 _ => println!("Invalid option"),
             }
