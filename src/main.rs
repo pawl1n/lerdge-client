@@ -48,122 +48,42 @@ impl Server {
         }
     }
 
-    fn search(&mut self) -> std::io::Result<Vec<Printer>> {
-        let ip_parts = self.local_ip.split('.').collect::<Vec<_>>();
-
-        let data = format!(
-            "<M888 A{} B{} C{} D{} P{}>\n",
-            ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3], self.port
-        );
-
+    fn send_broadcast_message(&mut self, message: &str) -> std::io::Result<Response> {
         self.socket.set_broadcast(true)?;
-        self.socket.send_to(data.as_bytes(), &self.broadcast)?;
-        println!("Sent: {}", data);
-
-        let mut found_printers = Vec::new();
+        self.socket.send_to(message.as_bytes(), &self.broadcast)?;
+        println!("Sent: {}", message);
 
         let mut buf = [0; 1024];
-
-        println!("Searching for printers...");
 
         let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
         let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
 
-        let response = Response::from_data(&received_data);
+        let response = Response::from_data(src_addr.to_string(), &received_data);
 
         println!(
             "Received message from {}: {}\n Status: {:}",
             src_addr, response.body, response.status
         );
 
-        if response.status == ResponseStatus::Ok {
-            let printer = Printer {
-                info: HashMap::new(),
-                address: src_addr.to_string(),
-            };
-
-            found_printers.push(printer);
-        }
-
-        Ok(found_printers)
+        Ok(response)
     }
 
-    fn get_printer_info(&self, printer: &Printer) -> std::io::Result<Printer> {
-        let message = "<M115>\n";
-        self.socket.send_to(message.as_bytes(), &printer.address)?;
+    fn send_message(&self, message: &str, address: &str) -> std::io::Result<Response> {
+        self.socket.send_to(message.as_bytes(), address)?;
 
         let mut buf = [0; 1024];
 
         let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
         let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
 
-        if src_addr.to_string() == printer.address && !received_data.trim().is_empty() {
-            let response = Response::from_data(&received_data);
-            let mut printer = Printer {
-                info: HashMap::new(),
-                address: src_addr.to_string(),
-            };
-            printer.info = response
-                .body
-                .split('\r')
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| {
-                    let cleaned = s.replace("\n", "");
-                    let parts = cleaned.trim().split(':').collect::<Vec<_>>();
-                    if parts.len() != 2 {
-                        println!("Invalid printer info: {}", cleaned);
-                        return ("".to_string(), "".to_string());
-                    }
+        let response = Response::from_data(src_addr.to_string(), &received_data);
 
-                    let key = parts[0].trim().to_string();
-                    let value = parts[1].trim().to_string();
+        println!(
+            "Received message from {}: {}\n Status: {:}",
+            src_addr, response.body, response.status
+        );
 
-                    (key, value)
-                })
-                .collect();
-            return Ok(printer);
-        }
-
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to get printer info",
-        ))
-    }
-
-    fn get_stats(&self, printer: &Printer) -> std::io::Result<String> {
-        let message = "M86\n";
-        self.socket.send_to(message.as_bytes(), &printer.address)?;
-
-        let mut buf = [0; 1024];
-
-        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
-        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
-
-        if src_addr.to_string() == printer.address && !received_data.trim().is_empty() {
-            let response = Response::from_data(&received_data);
-            println!("{}", response.body);
-            return Ok(response.body);
-        }
-
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "Failed to get printer stats",
-        ))
-    }
-}
-
-#[derive(Debug)]
-enum SelectedOption {
-    Search,
-    SelectPrinter,
-    // ConnectManually,
-    Exit,
-    None,
-}
-
-impl Default for SelectedOption {
-    fn default() -> Self {
-        Self::Search
+        Ok(response)
     }
 }
 
@@ -173,18 +93,56 @@ struct Printer {
     address: String,
 }
 
-struct InterfaceError {
-    message: String,
-}
-
 #[derive(Debug)]
 struct PrinterInterface<'a> {
     server: &'a mut Server,
+    printer: Printer,
 }
 
 impl<'a> PrinterInterface<'a> {
-    fn new(server: &'a mut Server) -> Self {
-        Self { server }
+    fn new(server: &'a mut Server, printer: Printer) -> Self {
+        Self { server, printer }
+    }
+
+    fn run(&mut self) {
+        loop {
+            println!();
+            println!("Printer interface ({})", self.printer.address);
+            println!("1. Get stats");
+            println!("2. Send command");
+            println!("0. Exit");
+
+            let mut input = String::new();
+            println!();
+            println!("Select an option: ");
+            std::io::stdin()
+                .read_line(&mut input)
+                .expect("Failed to read input");
+            let index = input.trim().parse::<usize>().unwrap();
+
+            println!();
+
+            match index {
+                1 => self.show_stats(),
+                2 => self.send_message(),
+                0 => break,
+                _ => println!("Invalid option"),
+            }
+        }
+    }
+
+    fn show_stats(&self) {
+        let message = "M86\n";
+        self.server
+            .send_message(message, &self.printer.address)
+            .map_or_else(
+                |_| println!("Failed to get stats"),
+                |response| println!("Stats: {}", response.body),
+            );
+    }
+
+    fn send_message(&self) {
+        todo!()
     }
 }
 
@@ -215,30 +173,33 @@ impl MainInterface {
 
             println!();
 
-            let selected_option = match index {
-                1 => SelectedOption::Search,
-                2 => SelectedOption::SelectPrinter,
-                // 4 => SelectedOption::ConnectManually,
-                0 => SelectedOption::Exit,
-                _ => SelectedOption::None,
-            };
-
-            match selected_option {
-                SelectedOption::Search => self.search(),
-                SelectedOption::SelectPrinter => self.select_printer(),
-                // SelectedOption::ShowStats => self.show_stats(),
-                // SelectedOption::ConnectManually => self.connect_manually(),
-                SelectedOption::Exit => break,
-                SelectedOption::None => println!("Invalid option"),
+            match index {
+                1 => self.search(),
+                2 => self.select_printer(),
+                // 3 => self.show_stats(),
+                // 4 => self.connect_manually(),
+                0 => break,
+                _ => println!("Invalid option"),
             }
         }
     }
 
     fn search(&mut self) {
         println!("Searching for printers...");
-        self.available_printers = self.server.search().unwrap_or_else(|err| {
-            println!("Error: {}", err);
-            Vec::new()
+        let ip_parts = self.server.local_ip.split('.').collect::<Vec<_>>();
+
+        let data = format!(
+            "<M888 A{} B{} C{} D{} P{}>\n",
+            ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3], self.server.port
+        );
+        let response = self
+            .server
+            .send_broadcast_message(&data)
+            .expect("Error sending message");
+
+        self.available_printers.push(Printer {
+            address: response.address,
+            info: Default::default(),
         });
 
         println!("Found {} printers", self.available_printers.len());
@@ -257,15 +218,38 @@ impl MainInterface {
         let mut input = String::new();
         std::io::stdin().read_line(&mut input).unwrap();
         let index = input.trim().parse::<usize>().unwrap();
+        let message = "<M115>\n";
         self.selected_printer = self
             .server
-            .get_printer_info(&self.available_printers[index])
+            .send_message(message, &self.available_printers[index].address)
             .map_or_else(
                 |_| {
                     println!("Failed to get printer info");
                     None
                 },
-                |printer| {
+                |response| {
+                    let mut printer = Printer {
+                        info: HashMap::new(),
+                        address: response.address.to_string(),
+                    };
+                    printer.info = response
+                        .body
+                        .split('\r')
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| {
+                            let cleaned = s.replace('\n', "");
+                            let parts = cleaned.trim().split(':').collect::<Vec<_>>();
+                            if parts.len() != 2 {
+                                println!("Invalid printer info: {}", cleaned);
+                                return ("".to_string(), "".to_string());
+                            }
+
+                            let key = parts[0].trim().to_string();
+                            let value = parts[1].trim().to_string();
+
+                            (key, value)
+                        })
+                        .collect();
                     println!("Selected printer: {}", printer.address);
                     println!("Info:");
                     for (key, value) in printer.info.iter() {
@@ -274,16 +258,10 @@ impl MainInterface {
                     Some(printer)
                 },
             );
-    }
 
-    fn show_stats(&self) {
         if let Some(printer) = &self.selected_printer {
-            self.server.get_stats(printer).map_or_else(
-                |_| println!("Failed to get stats"),
-                |stats| println!("Stats: {}", stats),
-            );
-        } else {
-            println!("No printer selected");
+            let mut printer_interface = PrinterInterface::new(&mut self.server, printer.clone());
+            printer_interface.run();
         }
     }
 }
@@ -305,12 +283,13 @@ impl std::fmt::Display for ResponseStatus {
 
 #[derive(Debug)]
 struct Response {
+    address: String,
     body: String,
     status: ResponseStatus,
 }
 
 impl Response {
-    fn from_data(data: &str) -> Self {
+    fn from_data(address: String, data: &str) -> Self {
         let trimmed = data.trim();
         let status = if trimmed.ends_with("ok") {
             ResponseStatus::Ok
@@ -320,6 +299,10 @@ impl Response {
 
         let body = trimmed[..trimmed.rfind('\n').unwrap_or(trimmed.len())].to_string();
 
-        Self { body, status }
+        Self {
+            address,
+            body,
+            status,
+        }
     }
 }
