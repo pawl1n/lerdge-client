@@ -1,6 +1,6 @@
 # Lerdge Client [WIP]
 
-This app mimicks the Lerdge Desktop app UDP request to printer.
+This app mimicks the Lerdge Desktop app UDP requests to printer.
 
 # Features
 
