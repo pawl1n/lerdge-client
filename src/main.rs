@@ -6,7 +6,7 @@ const TARGET_PORT: u16 = 8686; // Target printer port
 
 fn main() {
     let broadcast = format!("{}:{}", BROADCAST, TARGET_PORT);
-    let local_ip = local_ip_address::local_ip().unwrap_or_else(|err| panic!("{}", err));
+    let local_ip = local_ip_address::local_ip().expect("Could not get local IP address");
     let server = Server::new(local_ip.to_string(), PORT, broadcast);
     let mut main_interface = MainInterface {
         server,
@@ -29,7 +29,7 @@ impl Default for Server {
         Self {
             local_ip: "127.0.0.1".to_string(),
             port: 0,
-            socket: UdpSocket::bind("0.0.0.0:0").unwrap(),
+            socket: UdpSocket::bind("0.0.0.0:0").expect("Could not bind to address"),
             broadcast: "255.255.255.255:8686".to_string(),
         }
     }
@@ -118,14 +118,14 @@ impl<'a> PrinterInterface<'a> {
             std::io::stdin()
                 .read_line(&mut input)
                 .expect("Failed to read input");
-            let index = input.trim().parse::<usize>().unwrap();
+            let index = input.trim().parse::<usize>();
 
             println!();
 
             match index {
-                1 => self.show_stats(),
-                2 => self.send_message(),
-                0 => break,
+                Ok(1) => self.show_stats(),
+                Ok(2) => self.send_message(),
+                Ok(0) => break,
                 _ => println!("Invalid option"),
             }
         }
@@ -178,14 +178,14 @@ impl MainInterface {
             std::io::stdin()
                 .read_line(&mut input)
                 .expect("Failed to read input");
-            let index = input.trim().parse::<usize>().unwrap();
+            let index = input.trim().parse::<usize>();
 
             println!();
 
             match index {
-                1 => self.search(),
-                2 => self.select_printer(),
-                0 => break,
+                Ok(1) => self.search(),
+                Ok(2) => self.select_printer(),
+                Ok(0) => break,
                 _ => println!("Invalid option"),
             }
         }
@@ -212,6 +212,31 @@ impl MainInterface {
         println!("Found {} printers", self.available_printers.len());
     }
 
+    fn read_printer_number(&self) -> usize {
+        let mut input = String::new();
+
+        loop {
+            std::io::stdin()
+                .read_line(&mut input)
+                .expect("Failed to read input");
+
+            let index_result = input.trim().parse::<usize>();
+
+            match index_result {
+                Ok(i) => {
+                    if i < self.available_printers.len() {
+                        return i;
+                    } else {
+                        println!("Invalid option");
+                    }
+                }
+                Err(_) => println!("Invalid number"),
+            }
+
+            input.clear();
+        }
+    }
+
     fn select_printer(&mut self) {
         if self.available_printers.is_empty() {
             println!("No printers found");
@@ -219,13 +244,13 @@ impl MainInterface {
         }
 
         println!("Select a printer:");
+
         for (i, printer) in self.available_printers.iter().enumerate() {
             println!("{}: {}", i, printer.address);
         }
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).unwrap();
-        let index = input.trim().parse::<usize>().unwrap();
         let message = "<M115>\n";
+        let index = self.read_printer_number();
+
         self.selected_printer = self
             .server
             .send_message(message, &self.available_printers[index].address)
