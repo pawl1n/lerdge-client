@@ -1,6 +1,6 @@
 use std::{collections::HashMap, net::UdpSocket};
 
-const PORT: u16 = 34254; // Port to listen on
+const PORT: u16 = 0; // Port to listen on
 const BROADCAST: &str = "255.255.255.255"; // Broadcast address
 const TARGET_PORT: u16 = 8686; // Target printer port
 
@@ -19,7 +19,6 @@ fn main() {
 #[derive(Debug)]
 struct Server {
     local_ip: String,
-    port: u16,
     socket: UdpSocket,
     broadcast: String,
 }
@@ -28,7 +27,6 @@ impl Default for Server {
     fn default() -> Self {
         Self {
             local_ip: "127.0.0.1".to_string(),
-            port: 0,
             socket: UdpSocket::bind("0.0.0.0:0").expect("Could not bind to address"),
             broadcast: "255.255.255.255:8686".to_string(),
         }
@@ -42,7 +40,6 @@ impl Server {
 
         Self {
             local_ip,
-            port,
             socket,
             broadcast,
         }
@@ -197,7 +194,15 @@ impl MainInterface {
 
         let data = format!(
             "<M888 A{} B{} C{} D{} P{}>\n",
-            ip_parts[0], ip_parts[1], ip_parts[2], ip_parts[3], self.server.port
+            ip_parts[0],
+            ip_parts[1],
+            ip_parts[2],
+            ip_parts[3],
+            self.server
+                .socket
+                .local_addr()
+                .expect("Could not get socket address")
+                .port()
         );
         let response = self
             .server
