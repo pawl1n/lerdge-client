@@ -195,7 +195,7 @@ impl MainInterface {
         let ip_parts = self.server.local_ip.split('.').collect::<Vec<_>>();
 
         let data = format!(
-            "<M888 A{} B{} C{} D{} P{}>\n",
+            "M888 A{} B{} C{} D{} P{}\n",
             ip_parts[0],
             ip_parts[1],
             ip_parts[2],
@@ -255,8 +255,10 @@ impl MainInterface {
         for (i, printer) in self.available_printers.iter().enumerate() {
             println!("{}: {}", i, printer.address);
         }
-        let message = "<M115>\n";
+
         let index = self.read_printer_number();
+
+        let message = "M115\n";
 
         self.selected_printer = self
             .server
