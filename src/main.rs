@@ -189,6 +189,8 @@ impl MainInterface {
     }
 
     fn search(&mut self) {
+        self.available_printers.clear();
+
         println!("Searching for printers...");
         let ip_parts = self.server.local_ip.split('.').collect::<Vec<_>>();
 
