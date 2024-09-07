@@ -25,9 +25,14 @@ struct Server {
 
 impl Default for Server {
     fn default() -> Self {
+        let socket = UdpSocket::bind("0.0.0.0:0").expect("Could not bind to address");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("set_read_timeout call failed");
+
         Self {
             local_ip: "127.0.0.1".to_string(),
-            socket: UdpSocket::bind("0.0.0.0:0").expect("Could not bind to address"),
+            socket,
             broadcast: "255.255.255.255:8686".to_string(),
         }
     }
@@ -37,6 +42,9 @@ impl Server {
     fn new(local_ip: String, port: u16, broadcast: String) -> Self {
         let address = format!("{}:{}", local_ip, port);
         let socket = UdpSocket::bind(address).expect("Could not bind to address");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .expect("set_read_timeout call failed");
 
         Self {
             local_ip,
@@ -82,6 +90,22 @@ impl Server {
 
         Ok(response)
     }
+
+    fn read_message(&self) -> std::io::Result<Response> {
+        let mut buf = [0; 1024];
+
+        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
+        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
+
+        let response = Response::from_data(src_addr.to_string(), &received_data);
+
+        println!(
+            "Received message from {}: {}\n Status: {:}",
+            src_addr, response.body, response.status
+        );
+
+        Ok(response)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +131,7 @@ impl<'a> PrinterInterface<'a> {
             println!("Printer interface ({})", self.printer.address);
             println!("1. Get stats");
             println!("2. Send command");
+            println!("3. Send file");
             println!("0. Exit");
 
             let mut input = String::new();
@@ -122,6 +147,7 @@ impl<'a> PrinterInterface<'a> {
             match index {
                 Ok(1) => self.show_stats(),
                 Ok(2) => self.send_message(),
+                Ok(3) => self.send_file(),
                 Ok(0) => break,
                 _ => println!("Invalid option"),
             }
@@ -150,6 +176,74 @@ impl<'a> PrinterInterface<'a> {
                 |_| println!("Failed to send message"),
                 |response| println!("Message sent: {}", response.body),
             );
+    }
+
+    fn send_file(&self) {
+        println!("Enter file path: ");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read input");
+
+        let file_path = input.trim();
+        let filename = file_path.split('/').last().expect("Invalid file path");
+        let size = std::fs::metadata(file_path).expect("File not found").len();
+
+        let message = format!("M828 P{size} U:{filename}\n\n"); // Create file
+
+        self.server
+            .send_message(&message, &self.printer.address)
+            .map_or_else(
+                |_| println!("Failed to create file"),
+                |response| println!("File created: {}", response.body),
+            );
+
+        let chunk_size = 1442; // Chunk size in bytes (1442 as in Lerdge official program)
+        let mut start = 0;
+
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut f = std::fs::File::open(file_path).expect("Failed to open file");
+
+        // Wait for ok message
+        let response = self.server.read_message();
+        if let Ok(response) = response {
+            println!("{}", response.body);
+        }
+
+        let mut repeat = true;
+
+        while start < size {
+            let count = std::cmp::min(chunk_size, size - start) as usize;
+            println!("Sending {}-{} of {}", start, start + count as u64, size);
+
+            start = f.seek(SeekFrom::Start(start)).expect("Failed to seek") + count as u64;
+            let mut buf = vec![0; count];
+            f.read_exact(&mut buf).expect("Failed to read file");
+
+            let chunk = format!("\n\n\n\n\n\n\nU{}", String::from_utf8_lossy(&buf[..count]));
+
+            let response = self.server.send_message(&chunk, &self.printer.address);
+
+            match response {
+                Ok(response) => match response.status {
+                    ResponseStatus::Ok => println!("Chunk sent"),
+                    _ => {
+                        println!("Error sending chunk: {}", response.body);
+                        break;
+                    }
+                },
+                Err(e) => {
+                    eprintln!("Error sending chunk: {}", e);
+                    repeat = true;
+                }
+            }
+
+            if repeat {
+                start = 0;
+                repeat = false;
+            }
+        }
     }
 }
 
@@ -311,6 +405,7 @@ impl MainInterface {
 enum ResponseStatus {
     Ok,
     Error,
+    Unknown,
 }
 
 impl std::fmt::Display for ResponseStatus {
@@ -318,6 +413,7 @@ impl std::fmt::Display for ResponseStatus {
         match self {
             ResponseStatus::Ok => write!(f, "Ok"),
             ResponseStatus::Error => write!(f, "Error"),
+            ResponseStatus::Unknown => write!(f, "Error"),
         }
     }
 }
@@ -332,10 +428,12 @@ struct Response {
 impl Response {
     fn from_data(address: String, data: &str) -> Self {
         let trimmed = data.trim();
-        let status = if trimmed.ends_with("ok") {
+        let status = if trimmed.contains("error") {
+            ResponseStatus::Error
+        } else if trimmed.ends_with("ok") {
             ResponseStatus::Ok
         } else {
-            ResponseStatus::Error
+            ResponseStatus::Unknown
         };
 
         let body = trimmed[..trimmed.rfind('\n').unwrap_or(trimmed.len())].to_string();
