@@ -211,13 +211,24 @@ impl<'a> PrinterInterface<'a> {
             println!("{}", response.body);
         }
 
-        let mut repeat = true;
+        let re = regex::Regex::new(r"U:(<chunk>[0-9]+)").expect("Invalid regex");
 
         while start < size {
+            let mut chunk_number = 0;
+            let response = self.server.read_message();
+            if let Ok(response) = response {
+                if let Some(captures) = re.captures(&response.body) {
+                   println!("{captures:?}");
+                   chunk_number = captures["chunk"].trim().parse::<u64>().expect("Invalid chunk number");
+                }
+                println!("{}", response.body);
+            }
+
             let count = std::cmp::min(chunk_size, size - start) as usize;
             println!("Sending {}-{} of {}", start, start + count as u64, size);
+            start += chunk_number * chunk_size;
 
-            start = f.seek(SeekFrom::Start(start)).expect("Failed to seek") + count as u64;
+            _ = f.seek(SeekFrom::Start(start)).expect("Failed to seek") + count as u64;
             let mut buf = vec![0; count];
             f.read_exact(&mut buf).expect("Failed to read file");
 
@@ -235,13 +246,7 @@ impl<'a> PrinterInterface<'a> {
                 },
                 Err(e) => {
                     eprintln!("Error sending chunk: {}", e);
-                    repeat = true;
                 }
-            }
-
-            if repeat {
-                start = 0;
-                repeat = false;
             }
         }
     }
