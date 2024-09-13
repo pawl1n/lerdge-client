@@ -106,6 +106,24 @@ impl Server {
 
         Ok(response)
     }
+
+    fn send_bytes(&self, bytes: &[u8], address: &str) -> std::io::Result<Response> {
+        self.socket.send_to(bytes, address)?;
+
+        let mut buf = [0; 1024];
+
+        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
+        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
+
+        let response = Response::from_data(src_addr.to_string(), &received_data);
+
+        println!(
+            "Received message from {}: {}\n Status: {:}",
+            src_addr, response.body, response.status
+        );
+
+        Ok(response)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -187,9 +205,9 @@ impl<'a> PrinterInterface<'a> {
 
         let file_path = input.trim();
         let filename = file_path.split('/').last().expect("Invalid file path");
-        let size = std::fs::metadata(file_path).expect("File not found").len();
+        let filesize = std::fs::metadata(file_path).expect("File not found").len();
 
-        let message = format!("M828 P{size} U:{filename}\n\n"); // Create file
+        let message = format!("M828 P{filesize} U:{filename}\n\n"); // Create file
 
         self.server
             .send_message(&message, &self.printer.address)
@@ -213,7 +231,7 @@ impl<'a> PrinterInterface<'a> {
 
         let re = regex::Regex::new(r"U:(<chunk>[0-9]+)").expect("Invalid regex");
 
-        while start < size {
+        while start < filesize {
             let mut chunk_number = 0;
             let response = self.server.read_message();
             if let Ok(response) = response {
@@ -224,17 +242,51 @@ impl<'a> PrinterInterface<'a> {
                 println!("{}", response.body);
             }
 
-            let count = std::cmp::min(chunk_size, size - start) as usize;
-            println!("Sending {}-{} of {}", start, start + count as u64, size);
+            let count = std::cmp::min(chunk_size, filesize - start) as usize;
+            println!("Sending {}-{} of {}", start, start + count as u64, filesize);
             start += chunk_number * chunk_size;
 
             _ = f.seek(SeekFrom::Start(start)).expect("Failed to seek") + count as u64;
             let mut buf = vec![0; count];
             f.read_exact(&mut buf).expect("Failed to read file");
 
-            let chunk = format!("\n\n\n\n\n\n\nU{}", String::from_utf8_lossy(&buf[..count]));
+            let mut data = vec![0_u8; 8];
 
-            let response = self.server.send_message(&chunk, &self.printer.address);
+            let mut offset = 0;
+            data[offset] = 0xaa;
+            offset += 1;
+
+            if chunk_number > (u8::MAX as u64).pow(3) {
+                eprint!("Chunk number is too large: {}", chunk_number);
+                return;
+            }
+
+            data[offset] = (chunk_number >> 16 & 0xff) as u8;
+            offset += 1;
+            data[offset] = (chunk_number >> 8 & 0xff) as u8;
+            offset += 1;
+            data[offset] = (chunk_number & 0xff) as u8;
+            offset += 1;
+
+            if count > u16::MAX as usize {
+                eprint!("Length is too large: {}", count);
+                return;
+            }
+
+            data[offset] = (count >> 8 & 0xff) as u8;
+            offset += 1;
+            data[offset] = (count & 0xff) as u8;
+            offset += 1;
+
+            data[offset] = self.xor8checksum(&buf[..count]);
+
+            offset += 1;
+
+            data[offset] = 0x55;
+            data.extend_from_slice(&buf[..count]);
+            data.extend_from_slice("\n".as_bytes());
+
+            let response = self.server.send_bytes(&data, &self.printer.address);
 
             match response {
                 Ok(response) => match response.status {
@@ -249,6 +301,17 @@ impl<'a> PrinterInterface<'a> {
                 }
             }
         }
+    }
+
+    fn xor8checksum(&self, data: &[u8]) -> u8 {
+        // Use only full octets for checksum, offset by 2
+        let trimmed = data
+            .trim_ascii()
+            .iter()
+            .take(((data.trim_ascii().len() + 2) / 8 ) * 8)
+            .collect::<Vec<_>>();
+        println!("XOR8 checksum: {:?}", trimmed);
+        data.trim_ascii().iter().take((data.trim_ascii().len() + 2) / 8 * 8).fold(0_u8, |acc, x| acc ^ x)
     }
 }
 
@@ -307,15 +370,26 @@ impl MainInterface {
         );
         let response = self
             .server
-            .send_broadcast_message(&data)
-            .expect("Error sending message");
+            .send_broadcast_message(&data);
 
-        self.available_printers.push(Printer {
-            address: response.address,
-            info: Default::default(),
-        });
+        match response {
+            Ok(response) => match response.status {
+                ResponseStatus::Ok => {
+                    self.available_printers.push(Printer {
+                        address: response.address,
+                        info: Default::default(),
+                    });
 
-        println!("Found {} printers", self.available_printers.len());
+                    println!("Found {} printers", response.body);
+                }
+                _ => {
+                    println!("Error searching for printers: {}", response.body);
+                }
+            },
+            Err(e) => {
+                eprintln!("Error searching for printers: {}", e);
+            }
+        }
     }
 
     fn read_printer_number(&self) -> usize {
