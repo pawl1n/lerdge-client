@@ -1,4 +1,7 @@
-use std::{collections::HashMap, net::UdpSocket};
+use std::collections::HashMap;
+
+use server::{ResponseStatus, UdpServer};
+mod server;
 
 const PORT: u16 = 0; // Port to listen on
 const BROADCAST: &str = "255.255.255.255"; // Broadcast address
@@ -7,123 +10,13 @@ const TARGET_PORT: u16 = 8686; // Target printer port
 fn main() {
     let broadcast = format!("{}:{}", BROADCAST, TARGET_PORT);
     let local_ip = local_ip_address::local_ip().expect("Could not get local IP address");
-    let server = Server::new(local_ip.to_string(), PORT, broadcast);
+    let server = server::UdpServer::new(local_ip.to_string(), PORT, broadcast);
     let mut main_interface = MainInterface {
         server,
         ..Default::default()
     };
 
     main_interface.run();
-}
-
-#[derive(Debug)]
-struct Server {
-    local_ip: String,
-    socket: UdpSocket,
-    broadcast: String,
-}
-
-impl Default for Server {
-    fn default() -> Self {
-        let socket = UdpSocket::bind("0.0.0.0:0").expect("Could not bind to address");
-        socket
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .expect("set_read_timeout call failed");
-
-        Self {
-            local_ip: "127.0.0.1".to_string(),
-            socket,
-            broadcast: "255.255.255.255:8686".to_string(),
-        }
-    }
-}
-
-impl Server {
-    fn new(local_ip: String, port: u16, broadcast: String) -> Self {
-        let address = format!("{}:{}", local_ip, port);
-        let socket = UdpSocket::bind(address).expect("Could not bind to address");
-        socket
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
-            .expect("set_read_timeout call failed");
-
-        Self {
-            local_ip,
-            socket,
-            broadcast,
-        }
-    }
-
-    fn send_broadcast_message(&mut self, message: &str) -> std::io::Result<Response> {
-        self.socket.set_broadcast(true)?;
-        self.socket.send_to(message.as_bytes(), &self.broadcast)?;
-        println!("Sent: {}", message);
-
-        let mut buf = [0; 1024];
-
-        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
-        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
-
-        let response = Response::from_data(src_addr.to_string(), &received_data);
-
-        println!(
-            "Received message from {}: {}\n Status: {:}",
-            src_addr, response.body, response.status
-        );
-
-        Ok(response)
-    }
-
-    fn send_message(&self, message: &str, address: &str) -> std::io::Result<Response> {
-        self.socket.send_to(message.as_bytes(), address)?;
-
-        let mut buf = [0; 1024];
-
-        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
-        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
-
-        let response = Response::from_data(src_addr.to_string(), &received_data);
-
-        println!(
-            "Received message from {}: {}\n Status: {:}",
-            src_addr, response.body, response.status
-        );
-
-        Ok(response)
-    }
-
-    fn read_message(&self) -> std::io::Result<Response> {
-        let mut buf = [0; 1024];
-
-        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
-        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
-
-        let response = Response::from_data(src_addr.to_string(), &received_data);
-
-        println!(
-            "Received message from {}: {}\n Status: {:}",
-            src_addr, response.body, response.status
-        );
-
-        Ok(response)
-    }
-
-    fn send_bytes(&self, bytes: &[u8], address: &str) -> std::io::Result<Response> {
-        self.socket.send_to(bytes, address)?;
-
-        let mut buf = [0; 1024];
-
-        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
-        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
-
-        let response = Response::from_data(src_addr.to_string(), &received_data);
-
-        println!(
-            "Received message from {}: {}\n Status: {:}",
-            src_addr, response.body, response.status
-        );
-
-        Ok(response)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -134,12 +27,12 @@ struct Printer {
 
 #[derive(Debug)]
 struct PrinterInterface<'a> {
-    server: &'a mut Server,
+    server: &'a mut UdpServer,
     printer: Printer,
 }
 
 impl<'a> PrinterInterface<'a> {
-    fn new(server: &'a mut Server, printer: Printer) -> Self {
+    fn new(server: &'a mut UdpServer, printer: Printer) -> Self {
         Self { server, printer }
     }
 
@@ -216,7 +109,7 @@ impl<'a> PrinterInterface<'a> {
                 |response| println!("File created: {}", response.body),
             );
 
-        let chunk_size = 1442; // Chunk size in bytes (1442 as in Lerdge official program)
+        let chunk_size = 1442; // Chunk size in bytes (1442 + 8 bytes header = 1450 bytes)
         let mut start = 0;
 
         use std::io::{Read, Seek, SeekFrom};
@@ -236,8 +129,11 @@ impl<'a> PrinterInterface<'a> {
             let response = self.server.read_message();
             if let Ok(response) = response {
                 if let Some(captures) = re.captures(&response.body) {
-                   println!("{captures:?}");
-                   chunk_number = captures["chunk"].trim().parse::<u64>().expect("Invalid chunk number");
+                    println!("{captures:?}");
+                    chunk_number = captures["chunk"]
+                        .trim()
+                        .parse::<u64>()
+                        .expect("Invalid chunk number");
                 }
                 println!("{}", response.body);
             }
@@ -256,7 +152,7 @@ impl<'a> PrinterInterface<'a> {
             data[offset] = 0xaa;
             offset += 1;
 
-            if chunk_number > (u8::MAX as u64).pow(3) {
+            if chunk_number > (u8::MAX as u64 + 1).pow(3) {
                 eprint!("Chunk number is too large: {}", chunk_number);
                 return;
             }
@@ -278,7 +174,7 @@ impl<'a> PrinterInterface<'a> {
             data[offset] = (count & 0xff) as u8;
             offset += 1;
 
-            data[offset] = self.xor8checksum(&buf[..count]);
+            data[offset] = xor8checksum(&buf[..count]);
 
             offset += 1;
 
@@ -302,22 +198,37 @@ impl<'a> PrinterInterface<'a> {
             }
         }
     }
+}
 
-    fn xor8checksum(&self, data: &[u8]) -> u8 {
-        // Use only full octets for checksum, offset by 2
-        let trimmed = data
-            .trim_ascii()
-            .iter()
-            .take(((data.trim_ascii().len() + 2) / 8 ) * 8)
-            .collect::<Vec<_>>();
-        println!("XOR8 checksum: {:?}", trimmed);
-        data.trim_ascii().iter().take((data.trim_ascii().len() + 2) / 8 * 8).fold(0_u8, |acc, x| acc ^ x)
+fn xor8checksum(data: &[u8]) -> u8 {
+    // Use only full octets for checksum, offset by 2
+    let trimmed = data
+        .trim_ascii()
+        .iter()
+        .take(((data.trim_ascii().len() + 2) / 8) * 8 + 2)
+        .collect::<Vec<_>>();
+    println!("XOR8 checksum: {:?}", trimmed);
+    data.trim_ascii()
+        .iter()
+        .take((data.trim_ascii().len() + 2) / 8 * 8 + 2)
+        .fold(0_u8, |acc, x| acc ^ x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xor8checksum() {
+        let data = "Test data".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x42);
     }
 }
 
 #[derive(Debug, Default)]
 struct MainInterface {
-    server: Server,
+    server: server::UdpServer,
     selected_printer: Option<Printer>,
     available_printers: Vec<Printer>,
 }
@@ -368,9 +279,7 @@ impl MainInterface {
                 .expect("Could not get socket address")
                 .port()
         );
-        let response = self
-            .server
-            .send_broadcast_message(&data);
+        let response = self.server.send_broadcast_message(&data);
 
         match response {
             Ok(response) => match response.status {
@@ -476,51 +385,6 @@ impl MainInterface {
         if let Some(printer) = &self.selected_printer {
             let mut printer_interface = PrinterInterface::new(&mut self.server, printer.clone());
             printer_interface.run();
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum ResponseStatus {
-    Ok,
-    Error,
-    Unknown,
-}
-
-impl std::fmt::Display for ResponseStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ResponseStatus::Ok => write!(f, "Ok"),
-            ResponseStatus::Error => write!(f, "Error"),
-            ResponseStatus::Unknown => write!(f, "Error"),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Response {
-    address: String,
-    body: String,
-    status: ResponseStatus,
-}
-
-impl Response {
-    fn from_data(address: String, data: &str) -> Self {
-        let trimmed = data.trim();
-        let status = if trimmed.contains("error") {
-            ResponseStatus::Error
-        } else if trimmed.ends_with("ok") {
-            ResponseStatus::Ok
-        } else {
-            ResponseStatus::Unknown
-        };
-
-        let body = trimmed[..trimmed.rfind('\n').unwrap_or(trimmed.len())].to_string();
-
-        Self {
-            address,
-            body,
-            status,
         }
     }
 }
