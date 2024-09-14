@@ -8,6 +8,7 @@ This app mimicks the Lerdge Desktop app UDP requests to printer.
 2. Get printer info.
 3. Get printer sensors info.
 4. Send custom requests (g-code) to the printer.
+5. Transfer files.
 
 # Dependencies
 
