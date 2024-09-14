@@ -109,7 +109,7 @@ impl<'a> PrinterInterface<'a> {
                 |response| println!("File created: {}", response.body),
             );
 
-        let chunk_size = 1442; // Chunk size in bytes (1442 + 8 bytes header = 1450 bytes)
+        let chunk_size = 1442; // Chunk size in bytes (1450 - 8 bytes header = 1442 bytes)
         let mut start = 0;
 
         use std::io::{Read, Seek, SeekFrom};
@@ -117,32 +117,57 @@ impl<'a> PrinterInterface<'a> {
         let mut f = std::fs::File::open(file_path).expect("Failed to open file");
 
         // Wait for ok message
-        let response = self.server.read_message();
-        if let Ok(response) = response {
-            println!("{}", response.body);
-        }
-
-        let re = regex::Regex::new(r"U:(<chunk>[0-9]+)").expect("Invalid regex");
-
-        while start < filesize {
-            let mut chunk_number = 0;
+        loop {
             let response = self.server.read_message();
             if let Ok(response) = response {
-                if let Some(captures) = re.captures(&response.body) {
-                    println!("{captures:?}");
-                    chunk_number = captures["chunk"]
-                        .trim()
-                        .parse::<u64>()
-                        .expect("Invalid chunk number");
-                }
                 println!("{}", response.body);
+                if response.body.starts_with("ok") {
+                    break;
+                }
+            }
+        }
+
+        while start < filesize {
+            let chunk_number;
+            let response = self.server.read_message();
+            if let Ok(response) = response {
+                match parse_chunk_number(&response.body) {
+                    ChunkParseResult::Chunk(chunk) => chunk_number = chunk,
+                    ChunkParseResult::Error(error) => {
+                        eprintln!("\nFailed to parse chunk: {error}");
+                        break;
+                    }
+                    ChunkParseResult::FileTransferCompleted => {
+                        println!("\nFile transfer completed");
+                        break;
+                    }
+                    ChunkParseResult::FileTransferError => {
+                        println!("\nFile transfer error");
+                        break;
+                    }
+                }
+
+                if chunk_number * chunk_size > filesize {
+                    continue;
+                }
+            } else {
+                eprintln!("\n{}", response.unwrap_err());
+                continue;
             }
 
+            start = chunk_number * chunk_size;
             let count = std::cmp::min(chunk_size, filesize - start) as usize;
-            println!("Sending {}-{} of {}", start, start + count as u64, filesize);
-            start += chunk_number * chunk_size;
+            print!(
+                "\rSending chunk {}: {}-{} of {}",
+                chunk_number,
+                start,
+                start + count as u64,
+                filesize
+            );
+            use std::io::{stdout, Write};
+            stdout().flush().unwrap();
 
-            _ = f.seek(SeekFrom::Start(start)).expect("Failed to seek") + count as u64;
+            _ = f.seek(SeekFrom::Start(start)).expect("Failed to seek");
             let mut buf = vec![0; count];
             f.read_exact(&mut buf).expect("Failed to read file");
 
@@ -153,7 +178,7 @@ impl<'a> PrinterInterface<'a> {
             offset += 1;
 
             if chunk_number > (u8::MAX as u64 + 1).pow(3) {
-                eprint!("Chunk number is too large: {}", chunk_number);
+                eprint!("\nChunk number is too large: {}", chunk_number);
                 return;
             }
 
@@ -180,37 +205,50 @@ impl<'a> PrinterInterface<'a> {
 
             data[offset] = 0x55;
             data.extend_from_slice(&buf[..count]);
-            data.extend_from_slice("\n".as_bytes());
 
             let response = self.server.send_bytes(&data, &self.printer.address);
 
-            match response {
-                Ok(response) => match response.status {
-                    ResponseStatus::Ok => println!("Chunk sent"),
-                    _ => {
-                        println!("Error sending chunk: {}", response.body);
-                        break;
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Error sending chunk: {}", e);
-                }
+            if let Err(error) = response {
+                eprintln!("Failed to send data: {:?}", error);
             }
         }
     }
 }
 
+#[derive(Debug, PartialEq)]
+enum ChunkParseResult {
+    Chunk(u64),
+    FileTransferCompleted,
+    FileTransferError,
+    Error(String),
+}
+
+fn parse_chunk_number(data: &str) -> ChunkParseResult {
+    let re = regex::Regex::new(r"N (?<chunk>[0-9]+)").expect("Invalid regex");
+
+    if data.contains("File transfer completed") {
+        return ChunkParseResult::FileTransferCompleted;
+    } else if data.contains("File transfer error") {
+        return ChunkParseResult::FileTransferError;
+    } else if let Some(captures) = re.captures(data) {
+        let chunk_number = captures["chunk"].trim().parse::<u64>();
+
+        return match chunk_number {
+            Ok(chunk_number) => ChunkParseResult::Chunk(chunk_number),
+            Err(error) => ChunkParseResult::Error(error.to_string()),
+        };
+    }
+
+    ChunkParseResult::Error("Failed to parse chunk".to_string())
+}
+
 fn xor8checksum(data: &[u8]) -> u8 {
-    // Use only full octets for checksum, offset by 2
-    let trimmed = data
-        .trim_ascii()
-        .iter()
-        .take(((data.trim_ascii().len() + 2) / 8) * 8 + 2)
-        .collect::<Vec<_>>();
-    println!("XOR8 checksum: {:?}", trimmed);
-    data.trim_ascii()
-        .iter()
-        .take((data.trim_ascii().len() + 2) / 8 * 8 + 2)
+    if data.len() <= 8 {
+        return 0x00;
+    }
+
+    data.iter()
+        .take(data.len() - 8)
         .fold(0_u8, |acc, x| acc ^ x)
 }
 
@@ -219,10 +257,59 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_xor8checksum() {
-        let data = "Test data".as_bytes();
+    fn test_xor8checksum6() {
+        let data = "Test\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x00);
+    }
+
+    #[test]
+    fn test_xor8checksum7() {
+        let data = "Testq\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x00);
+    }
+
+    #[test]
+    fn test_xor8checksum8() {
+        let data = "Testqw\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x00);
+    }
+
+    #[test]
+    fn test_xor8checksum9() {
+        let data = "Testqwe\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x54);
+    }
+
+    #[test]
+    fn test_xor8checksum10() {
+        let data = "Testqwer\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x31);
+    }
+
+    #[test]
+    fn test_xor8checksum11() {
+        let data = "Testqwert\r\n".as_bytes();
         let checksum = xor8checksum(data);
         assert_eq!(checksum, 0x42);
+    }
+
+    #[test]
+    fn test_xor8checksum12() {
+        let data = "Testqwerty\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x36);
+    }
+
+    #[test]
+    fn test_parse_chunk_number() {
+        let data = "N 1234 ok\r\n";
+        let result = parse_chunk_number(data);
+        assert_eq!(result, ChunkParseResult::Chunk(1234));
     }
 }
 
@@ -288,8 +375,6 @@ impl MainInterface {
                         address: response.address,
                         info: Default::default(),
                     });
-
-                    println!("Found {} printers", response.body);
                 }
                 _ => {
                     println!("Error searching for printers: {}", response.body);

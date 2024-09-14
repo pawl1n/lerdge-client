@@ -11,7 +11,7 @@ impl Default for UdpServer {
     fn default() -> Self {
         let socket = UdpSocket::bind("0.0.0.0:0").expect("Could not bind to address");
         socket
-            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(3)))
             .expect("set_read_timeout call failed");
 
         Self {
@@ -81,32 +81,13 @@ impl UdpServer {
         let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
         let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
 
-        let response = Response::from_data(src_addr.to_string(), &received_data);
-
-        println!(
-            "Received message from {}: {}\n Status: {:}",
-            src_addr, response.body, response.status
-        );
-
-        Ok(response)
+        Ok(Response::from_data(src_addr.to_string(), &received_data))
     }
 
-    pub fn send_bytes(&self, bytes: &[u8], address: &str) -> std::io::Result<Response> {
+    pub fn send_bytes(&self, bytes: &[u8], address: &str) -> std::io::Result<()> {
         self.socket.send_to(bytes, address)?;
 
-        let mut buf = [0; 1024];
-
-        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
-        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
-
-        let response = Response::from_data(src_addr.to_string(), &received_data);
-
-        println!(
-            "Received message from {}: {}\n Status: {:}",
-            src_addr, response.body, response.status
-        );
-
-        Ok(response)
+        Ok(())
     }
 }
 
