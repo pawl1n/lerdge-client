@@ -1,4 +1,7 @@
-use std::{collections::HashMap, net::UdpSocket};
+use std::collections::HashMap;
+
+use server::{ResponseStatus, UdpServer};
+mod server;
 
 const PORT: u16 = 0; // Port to listen on
 const BROADCAST: &str = "255.255.255.255"; // Broadcast address
@@ -7,81 +10,13 @@ const TARGET_PORT: u16 = 8686; // Target printer port
 fn main() {
     let broadcast = format!("{}:{}", BROADCAST, TARGET_PORT);
     let local_ip = local_ip_address::local_ip().expect("Could not get local IP address");
-    let server = Server::new(local_ip.to_string(), PORT, broadcast);
+    let server = server::UdpServer::new(local_ip.to_string(), PORT, broadcast);
     let mut main_interface = MainInterface {
         server,
         ..Default::default()
     };
 
     main_interface.run();
-}
-
-#[derive(Debug)]
-struct Server {
-    local_ip: String,
-    socket: UdpSocket,
-    broadcast: String,
-}
-
-impl Default for Server {
-    fn default() -> Self {
-        Self {
-            local_ip: "127.0.0.1".to_string(),
-            socket: UdpSocket::bind("0.0.0.0:0").expect("Could not bind to address"),
-            broadcast: "255.255.255.255:8686".to_string(),
-        }
-    }
-}
-
-impl Server {
-    fn new(local_ip: String, port: u16, broadcast: String) -> Self {
-        let address = format!("{}:{}", local_ip, port);
-        let socket = UdpSocket::bind(address).expect("Could not bind to address");
-
-        Self {
-            local_ip,
-            socket,
-            broadcast,
-        }
-    }
-
-    fn send_broadcast_message(&mut self, message: &str) -> std::io::Result<Response> {
-        self.socket.set_broadcast(true)?;
-        self.socket.send_to(message.as_bytes(), &self.broadcast)?;
-        println!("Sent: {}", message);
-
-        let mut buf = [0; 1024];
-
-        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
-        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
-
-        let response = Response::from_data(src_addr.to_string(), &received_data);
-
-        println!(
-            "Received message from {}: {}\n Status: {:}",
-            src_addr, response.body, response.status
-        );
-
-        Ok(response)
-    }
-
-    fn send_message(&self, message: &str, address: &str) -> std::io::Result<Response> {
-        self.socket.send_to(message.as_bytes(), address)?;
-
-        let mut buf = [0; 1024];
-
-        let (number_of_bytes, src_addr) = self.socket.recv_from(&mut buf)?;
-        let received_data = String::from_utf8_lossy(&buf[..number_of_bytes]);
-
-        let response = Response::from_data(src_addr.to_string(), &received_data);
-
-        println!(
-            "Received message from {}: {}\n Status: {:}",
-            src_addr, response.body, response.status
-        );
-
-        Ok(response)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -92,12 +27,12 @@ struct Printer {
 
 #[derive(Debug)]
 struct PrinterInterface<'a> {
-    server: &'a mut Server,
+    server: &'a mut UdpServer,
     printer: Printer,
 }
 
 impl<'a> PrinterInterface<'a> {
-    fn new(server: &'a mut Server, printer: Printer) -> Self {
+    fn new(server: &'a mut UdpServer, printer: Printer) -> Self {
         Self { server, printer }
     }
 
@@ -107,6 +42,7 @@ impl<'a> PrinterInterface<'a> {
             println!("Printer interface ({})", self.printer.address);
             println!("1. Get stats");
             println!("2. Send command");
+            println!("3. Send file");
             println!("0. Exit");
 
             let mut input = String::new();
@@ -122,6 +58,7 @@ impl<'a> PrinterInterface<'a> {
             match index {
                 Ok(1) => self.show_stats(),
                 Ok(2) => self.send_message(),
+                Ok(3) => self.send_file(),
                 Ok(0) => break,
                 _ => println!("Invalid option"),
             }
@@ -151,11 +88,234 @@ impl<'a> PrinterInterface<'a> {
                 |response| println!("Message sent: {}", response.body),
             );
     }
+
+    fn send_file(&self) {
+        println!("Enter file path: ");
+        let mut input = String::new();
+        std::io::stdin()
+            .read_line(&mut input)
+            .expect("Failed to read input");
+
+        let file_path = input.trim();
+        let filename = file_path.split('/').last().expect("Invalid file path");
+        let filesize = std::fs::metadata(file_path).expect("File not found").len();
+
+        let message = format!("M828 P{filesize} U:{filename}\n\n"); // Create file
+
+        self.server
+            .send_message(&message, &self.printer.address)
+            .map_or_else(
+                |_| println!("Failed to create file"),
+                |response| println!("File created: {}", response.body),
+            );
+
+        let chunk_size = 1442; // Chunk size in bytes (1450 - 8 bytes header = 1442 bytes)
+        let mut start = 0;
+
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut f = std::fs::File::open(file_path).expect("Failed to open file");
+
+        // Wait for ok message
+        loop {
+            let response = self.server.read_message();
+            if let Ok(response) = response {
+                println!("{}", response.body);
+                if response.body.starts_with("ok") {
+                    break;
+                }
+            }
+        }
+
+        while start < filesize {
+            let chunk_number;
+            let response = self.server.read_message();
+            if let Ok(response) = response {
+                match parse_chunk_number(&response.body) {
+                    ChunkParseResult::Chunk(chunk) => chunk_number = chunk,
+                    ChunkParseResult::Error(error) => {
+                        eprintln!("\nFailed to parse chunk: {error}");
+                        break;
+                    }
+                    ChunkParseResult::FileTransferCompleted => {
+                        println!("\nFile transfer completed");
+                        break;
+                    }
+                    ChunkParseResult::FileTransferError => {
+                        println!("\nFile transfer error");
+                        break;
+                    }
+                }
+
+                if chunk_number * chunk_size > filesize {
+                    continue;
+                }
+            } else {
+                eprintln!("\n{}", response.unwrap_err());
+                continue;
+            }
+
+            start = chunk_number * chunk_size;
+            let count = std::cmp::min(chunk_size, filesize - start) as usize;
+            print!(
+                "\rSending chunk {}: {}-{} of {}",
+                chunk_number,
+                start,
+                start + count as u64,
+                filesize
+            );
+            use std::io::{stdout, Write};
+            stdout().flush().unwrap();
+
+            _ = f.seek(SeekFrom::Start(start)).expect("Failed to seek");
+            let mut buf = vec![0; count];
+            f.read_exact(&mut buf).expect("Failed to read file");
+
+            let mut data = vec![0_u8; 8];
+
+            let mut offset = 0;
+            data[offset] = 0xaa;
+            offset += 1;
+
+            if chunk_number > (u8::MAX as u64 + 1).pow(3) {
+                eprint!("\nChunk number is too large: {}", chunk_number);
+                return;
+            }
+
+            data[offset] = (chunk_number >> 16 & 0xff) as u8;
+            offset += 1;
+            data[offset] = (chunk_number >> 8 & 0xff) as u8;
+            offset += 1;
+            data[offset] = (chunk_number & 0xff) as u8;
+            offset += 1;
+
+            if count > u16::MAX as usize {
+                eprint!("Length is too large: {}", count);
+                return;
+            }
+
+            data[offset] = (count >> 8 & 0xff) as u8;
+            offset += 1;
+            data[offset] = (count & 0xff) as u8;
+            offset += 1;
+
+            data[offset] = xor8checksum(&buf[..count]);
+
+            offset += 1;
+
+            data[offset] = 0x55;
+            data.extend_from_slice(&buf[..count]);
+
+            let response = self.server.send_bytes(&data, &self.printer.address);
+
+            if let Err(error) = response {
+                eprintln!("Failed to send data: {:?}", error);
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ChunkParseResult {
+    Chunk(u64),
+    FileTransferCompleted,
+    FileTransferError,
+    Error(String),
+}
+
+fn parse_chunk_number(data: &str) -> ChunkParseResult {
+    let re = regex::Regex::new(r"N (?<chunk>[0-9]+)").expect("Invalid regex");
+
+    if data.contains("File transfer completed") {
+        return ChunkParseResult::FileTransferCompleted;
+    } else if data.contains("File transfer error") {
+        return ChunkParseResult::FileTransferError;
+    } else if let Some(captures) = re.captures(data) {
+        let chunk_number = captures["chunk"].trim().parse::<u64>();
+
+        return match chunk_number {
+            Ok(chunk_number) => ChunkParseResult::Chunk(chunk_number),
+            Err(error) => ChunkParseResult::Error(error.to_string()),
+        };
+    }
+
+    ChunkParseResult::Error("Failed to parse chunk".to_string())
+}
+
+fn xor8checksum(data: &[u8]) -> u8 {
+    if data.len() <= 8 {
+        return 0x00;
+    }
+
+    data.iter()
+        .take(data.len() - 8)
+        .fold(0_u8, |acc, x| acc ^ x)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_xor8checksum6() {
+        let data = "Test\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x00);
+    }
+
+    #[test]
+    fn test_xor8checksum7() {
+        let data = "Testq\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x00);
+    }
+
+    #[test]
+    fn test_xor8checksum8() {
+        let data = "Testqw\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x00);
+    }
+
+    #[test]
+    fn test_xor8checksum9() {
+        let data = "Testqwe\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x54);
+    }
+
+    #[test]
+    fn test_xor8checksum10() {
+        let data = "Testqwer\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x31);
+    }
+
+    #[test]
+    fn test_xor8checksum11() {
+        let data = "Testqwert\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x42);
+    }
+
+    #[test]
+    fn test_xor8checksum12() {
+        let data = "Testqwerty\r\n".as_bytes();
+        let checksum = xor8checksum(data);
+        assert_eq!(checksum, 0x36);
+    }
+
+    #[test]
+    fn test_parse_chunk_number() {
+        let data = "N 1234 ok\r\n";
+        let result = parse_chunk_number(data);
+        assert_eq!(result, ChunkParseResult::Chunk(1234));
+    }
 }
 
 #[derive(Debug, Default)]
 struct MainInterface {
-    server: Server,
+    server: server::UdpServer,
     selected_printer: Option<Printer>,
     available_printers: Vec<Printer>,
 }
@@ -206,17 +366,24 @@ impl MainInterface {
                 .expect("Could not get socket address")
                 .port()
         );
-        let response = self
-            .server
-            .send_broadcast_message(&data)
-            .expect("Error sending message");
+        let response = self.server.send_broadcast_message(&data);
 
-        self.available_printers.push(Printer {
-            address: response.address,
-            info: Default::default(),
-        });
-
-        println!("Found {} printers", self.available_printers.len());
+        match response {
+            Ok(response) => match response.status {
+                ResponseStatus::Ok => {
+                    self.available_printers.push(Printer {
+                        address: response.address,
+                        info: Default::default(),
+                    });
+                }
+                _ => {
+                    println!("Error searching for printers: {}", response.body);
+                }
+            },
+            Err(e) => {
+                eprintln!("Error searching for printers: {}", e);
+            }
+        }
     }
 
     fn read_printer_number(&self) -> usize {
@@ -303,47 +470,6 @@ impl MainInterface {
         if let Some(printer) = &self.selected_printer {
             let mut printer_interface = PrinterInterface::new(&mut self.server, printer.clone());
             printer_interface.run();
-        }
-    }
-}
-
-#[derive(Debug, PartialEq)]
-enum ResponseStatus {
-    Ok,
-    Error,
-}
-
-impl std::fmt::Display for ResponseStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ResponseStatus::Ok => write!(f, "Ok"),
-            ResponseStatus::Error => write!(f, "Error"),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct Response {
-    address: String,
-    body: String,
-    status: ResponseStatus,
-}
-
-impl Response {
-    fn from_data(address: String, data: &str) -> Self {
-        let trimmed = data.trim();
-        let status = if trimmed.ends_with("ok") {
-            ResponseStatus::Ok
-        } else {
-            ResponseStatus::Error
-        };
-
-        let body = trimmed[..trimmed.rfind('\n').unwrap_or(trimmed.len())].to_string();
-
-        Self {
-            address,
-            body,
-            status,
         }
     }
 }
